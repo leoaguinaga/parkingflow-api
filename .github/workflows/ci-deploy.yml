@@ -1,0 +1,70 @@
+name: API CI and VPS deployment
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Run integration checks
+        run: ./mvnw -B verify
+
+  publish-and-deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and publish immutable image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker build -t "$IMAGE:$IMAGE_TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:latest"
+      - name: Prepare VPS SSH access
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/parkflow_vps"
+          chmod 600 "$HOME/.ssh/parkflow_vps"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - name: Deploy image on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_DEPLOY_DIR: ${{ secrets.VPS_DEPLOY_DIR }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+        run: |
+          ssh -i "$HOME/.ssh/parkflow_vps" "$VPS_USER@$VPS_HOST" \
+            "mkdir -p '$VPS_DEPLOY_DIR'"
+          scp -i "$HOME/.ssh/parkflow_vps" deploy/compose.yaml \
+            "$VPS_USER@$VPS_HOST:$VPS_DEPLOY_DIR/compose.yaml"
+          scp -i "$HOME/.ssh/parkflow_vps" deploy/remote-deploy.sh \
+            "$VPS_USER@$VPS_HOST:$VPS_DEPLOY_DIR/remote-deploy.sh"
+          printf '%s' "$GHCR_READ_TOKEN" | ssh -i "$HOME/.ssh/parkflow_vps" "$VPS_USER@$VPS_HOST" \
+            "cd '$VPS_DEPLOY_DIR' && chmod 700 remote-deploy.sh && GHCR_USERNAME='$GHCR_USERNAME' ./remote-deploy.sh '$IMAGE_TAG'"
